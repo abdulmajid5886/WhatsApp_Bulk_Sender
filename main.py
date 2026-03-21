@@ -140,6 +140,28 @@ QCheckBox::indicator {
 # Async helper thread for WhatsApp bot operations
 # ---------------------------------------------------------------------------
 
+class BotLoopThread(threading.Thread):
+    """A long-running background thread that owns a single asyncio event loop.
+    Required because Playwright objects must all belong to the same living event loop."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        self.ready.set()
+        self.loop.run_forever()
+
+    def stop(self):
+        """Stop the loop and the thread."""
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+_bot_loop_thread = BotLoopThread()
+_bot_loop_thread.start()
+_bot_loop_thread.ready.wait()
+
 class AsyncWorker(QThread):
     """Generic worker that runs an async coroutine and emits result / error."""
     result_ready = Signal(object)
@@ -156,15 +178,21 @@ class AsyncWorker(QThread):
         self.progress_update.emit(msg)
 
     def run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            result = loop.run_until_complete(self._coro_func(*self._args))
+            if not _bot_loop_thread.loop.is_running():
+                self.error_occurred.emit("Bot loop is not running.")
+                return
+
+            # Submit the coroutine to the single persistent bot loop
+            future = asyncio.run_coroutine_threadsafe(
+                self._coro_func(*self._args),
+                _bot_loop_thread.loop
+            )
+            # Block this QThread until the coroutine completes
+            result = future.result()
             self.result_ready.emit(result)
         except Exception as exc:
             self.error_occurred.emit(str(exc))
-        finally:
-            loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +223,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         self._tabs = tabs
         tabs.currentChanged.connect(self._on_tab_changed)
+
+    def closeEvent(self, event):
+        """Clean up resources before closing the window."""
+        log_event("Closing application…")
+        # 1. Stop the bot (which closes the browser)
+        if self.wa_bot:
+            future = asyncio.run_coroutine_threadsafe(self.wa_bot.close(), _bot_loop_thread.loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
+        
+        # 2. Stop the asyncio loop thread
+        _bot_loop_thread.stop()
+        
+        event.accept()
 
     # ==================================================================
     # Tab 1 — Authentication
