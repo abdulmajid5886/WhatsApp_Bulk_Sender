@@ -8,7 +8,7 @@ import random
 import time
 import asyncio
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from utils import log_event, handle_error
 from whatsapp_automation import WhatsAppBot
@@ -34,11 +34,11 @@ class BulkSender(QThread):
         error(str)                  — critical error
     """
 
-    progress = pyqtSignal(int, int)
-    status = pyqtSignal(str, str, str)
-    finished_all = pyqtSignal(int, int)
-    log_message = pyqtSignal(str)
-    error = pyqtSignal(str)
+    progress = Signal(int, int)
+    status = Signal(str, str, str)
+    finished_all = Signal(int, int)
+    log_message = Signal(str)
+    error = Signal(str)
 
     def __init__(
         self,

@@ -1,0 +1,8 @@
+.wa_session/
+*.json
+*.log
+token.pickle
+.env
+.venv
+.vscode
+.DS_Store

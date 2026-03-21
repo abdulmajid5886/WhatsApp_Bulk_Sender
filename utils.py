@@ -45,15 +45,17 @@ def handle_error(error: Exception, context: str = "") -> str:
     return f"Error — {msg}"
 
 
-# ---------------------------------------------------------------------------
-# Phone number helpers
-# ---------------------------------------------------------------------------
+# Default country code for local numbers (Pakistan = 92)
+DEFAULT_COUNTRY_CODE = "92"
+
 
 def sanitize_phone(phone: str) -> str:
     """
     Normalize a phone number string:
     - Strip whitespace, dashes, parentheses, dots
-    - Ensure it starts with '+'
+    - ONLY for Pakistani local mobile numbers (03XXXXXXXXX, 11 digits): convert to +923XXXXXXXXX
+    - Fix double-prefixed: +9203XXXXXXX → +923XXXXXXX (strip extra 0)
+    - Leave all international numbers (UK +44, Malaysia +60, etc.) untouched
     Returns the cleaned number or empty string if invalid.
     """
     if not phone:
@@ -61,8 +63,21 @@ def sanitize_phone(phone: str) -> str:
     cleaned = re.sub(r"[\s\-\(\)\.]", "", phone.strip())
     if not cleaned:
         return ""
+
+    # Ensure leading '+'
     if not cleaned.startswith("+"):
         cleaned = "+" + cleaned
+
+    # Fix: +9203XXXXXXX → +923XXXXXXX (strip extra 0 after +92, only if followed by 3)
+    # This catches Pakistan mobile numbers stored as +920 3XX XXXXXXX
+    if cleaned.startswith("+920") and len(cleaned) > 5 and cleaned[4] == "3":
+        cleaned = "+92" + cleaned[4:]
+
+    # Local Pakistani mobile: +03XXXXXXXXX → +923XXXXXXXXX
+    # Only 03XX numbers (Pakistani mobile), exactly 11 digits after removing leading 0
+    if cleaned.startswith("+0") and cleaned[2:3] == "3" and len(cleaned) == 12:
+        cleaned = "+" + DEFAULT_COUNTRY_CODE + cleaned[2:]
+
     # Must contain only digits after the leading '+'
     if not re.match(r"^\+\d{7,15}$", cleaned):
         return ""

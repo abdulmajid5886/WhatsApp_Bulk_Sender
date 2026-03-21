@@ -12,14 +12,14 @@ import os
 import asyncio
 import threading
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QLineEdit, QComboBox, QFileDialog,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
     QSpinBox, QGroupBox, QMessageBox, QSplitter, QAbstractItemView,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
-from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtGui import QFont, QColor, QIcon, QPixmap
 
 from utils import log_event, handle_error, export_contacts_csv, import_contacts_csv, read_log_file
 from google_contacts import authenticate_google, fetch_google_contacts
@@ -142,13 +142,18 @@ QCheckBox::indicator {
 
 class AsyncWorker(QThread):
     """Generic worker that runs an async coroutine and emits result / error."""
-    result_ready = pyqtSignal(object)
-    error_occurred = pyqtSignal(str)
+    result_ready = Signal(object)
+    error_occurred = Signal(str)
+    progress_update = Signal(str)
 
     def __init__(self, coro_func, *args, parent=None):
         super().__init__(parent)
         self._coro_func = coro_func
         self._args = args
+
+    def _progress_callback(self, msg: str):
+        """Called from the async coroutine to relay progress to the GUI thread."""
+        self.progress_update.emit(msg)
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -179,6 +184,7 @@ class MainWindow(QMainWindow):
         self.contacts: list[dict] = []
         self.bulk_sender: BulkSender | None = None
         self._workers: list[AsyncWorker] = []
+        self._bot_busy = False  # Prevent concurrent bot operations
 
         # Tabs
         tabs = QTabWidget()
@@ -259,7 +265,7 @@ class MainWindow(QMainWindow):
         logged_in = await self.wa_bot.wait_for_login(timeout=120)
         return logged_in
 
-    @pyqtSlot(object)
+    @Slot(object)
     def _on_wa_started(self, logged_in):
         if logged_in:
             self.wa_status.setText("Status: ✅ Connected")
@@ -269,7 +275,7 @@ class MainWindow(QMainWindow):
         self.wa_open_btn.setEnabled(True)
         self.wa_check_btn.setEnabled(True)
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_wa_error(self, err):
         self.wa_status.setText(f"Status: ❌ {err}")
         self.wa_open_btn.setEnabled(True)
@@ -303,15 +309,27 @@ class MainWindow(QMainWindow):
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         src_row.addWidget(self.source_combo)
 
-        self.group_input = QLineEdit()
-        self.group_input.setPlaceholderText("Group name…")
-        self.group_input.setVisible(False)
-        src_row.addWidget(self.group_input)
+        # Group selection: combo + load button (visible when source = WhatsApp Group)
+        self.group_combo = QComboBox()
+        self.group_combo.setMinimumWidth(200)
+        self.group_combo.setPlaceholderText("Select a group…")
+        self.group_combo.setVisible(False)
+        src_row.addWidget(self.group_combo)
+
+        self.load_groups_btn = QPushButton("Load Groups")
+        self.load_groups_btn.setVisible(False)
+        self.load_groups_btn.clicked.connect(self._load_groups)
+        src_row.addWidget(self.load_groups_btn)
 
         self.fetch_btn = QPushButton("Fetch Contacts")
         self.fetch_btn.clicked.connect(self._fetch_contacts)
         src_row.addWidget(self.fetch_btn)
         layout.addLayout(src_row)
+
+        # Status label for progress feedback
+        self.fetch_status_lbl = QLabel("")
+        self.fetch_status_lbl.setStyleSheet("color: #64ffda; font-size: 12px; padding: 2px 4px;")
+        layout.addWidget(self.fetch_status_lbl)
 
         # Select all + count
         ctrl_row = QHBoxLayout()
@@ -342,22 +360,36 @@ class MainWindow(QMainWindow):
         return w
 
     def _on_source_changed(self, idx):
-        self.group_input.setVisible(idx == 2)
+        is_group = (idx == 2)
+        self.group_combo.setVisible(is_group)
+        self.load_groups_btn.setVisible(is_group)
 
     def _populate_table(self, contacts: list[dict]):
-        self.contacts = contacts
-        self.contact_table.setRowCount(len(contacts))
-        for i, c in enumerate(contacts):
+        """Populate the contact table, removing duplicates by phone number."""
+        # Deduplicate by phone number (keep first occurrence)
+        seen_phones = set()
+        unique_contacts = []
+        for c in contacts:
+            phone = c.get("phone", "")
+            name = c.get("name", "")
+            key = phone if phone else name  # Use name as key if no phone
+            if key and key not in seen_phones:
+                seen_phones.add(key)
+                unique_contacts.append(c)
+
+        self.contacts = unique_contacts
+        self.contact_table.setRowCount(len(unique_contacts))
+        for i, c in enumerate(unique_contacts):
             cb = QCheckBox()
             cb.setChecked(True)
             self.contact_table.setCellWidget(i, 0, cb)
             self.contact_table.setItem(i, 1, QTableWidgetItem(c.get("name", "")))
             self.contact_table.setItem(i, 2, QTableWidgetItem(c.get("phone", "")))
-        self.contact_count_lbl.setText(f"{len(contacts)} contacts")
+        self.contact_count_lbl.setText(f"{len(unique_contacts)} contacts")
         self.select_all_cb.setChecked(True)
 
     def _toggle_select_all(self, state):
-        checked = state == Qt.Checked
+        checked = (state == Qt.CheckState.Checked)
         for i in range(self.contact_table.rowCount()):
             cb = self.contact_table.cellWidget(i, 0)
             if cb:
@@ -378,6 +410,7 @@ class MainWindow(QMainWindow):
         source = self.source_combo.currentIndex()
         self.fetch_btn.setEnabled(False)
         self.fetch_btn.setText("Fetching…")
+        self.fetch_status_lbl.setText("⏳ Starting fetch…")
 
         if source == 0:  # Google
             self._fetch_google()
@@ -402,17 +435,25 @@ class MainWindow(QMainWindow):
             self.fetch_btn.setEnabled(True)
             self.fetch_btn.setText("Fetch Contacts")
             return
+        if self._bot_busy:
+            QMessageBox.warning(self, "Busy", "Another WhatsApp operation is in progress. Please wait.")
+            self.fetch_btn.setEnabled(True)
+            self.fetch_btn.setText("Fetch Contacts")
+            return
 
+        self._bot_busy = True
         worker = AsyncWorker(self.wa_bot.get_all_contacts)
+        worker._args = (worker._progress_callback,)
+        worker.progress_update.connect(self._on_fetch_progress)
         worker.result_ready.connect(self._on_contacts_fetched)
         worker.error_occurred.connect(self._on_fetch_error)
         self._workers.append(worker)
         worker.start()
 
     def _fetch_wa_group(self):
-        group_name = self.group_input.text().strip()
+        group_name = self.group_combo.currentText().strip()
         if not group_name:
-            QMessageBox.warning(self, "Error", "Enter a group name.")
+            QMessageBox.warning(self, "Error", "Select a group first. Click 'Load Groups' to populate the list.")
             self.fetch_btn.setEnabled(True)
             self.fetch_btn.setText("Fetch Contacts")
             return
@@ -421,24 +462,84 @@ class MainWindow(QMainWindow):
             self.fetch_btn.setEnabled(True)
             self.fetch_btn.setText("Fetch Contacts")
             return
+        if self._bot_busy:
+            QMessageBox.warning(self, "Busy", "Another WhatsApp operation is in progress. Please wait.")
+            self.fetch_btn.setEnabled(True)
+            self.fetch_btn.setText("Fetch Contacts")
+            return
 
+        self._bot_busy = True
         worker = AsyncWorker(self.wa_bot.get_group_members, group_name)
         worker.result_ready.connect(self._on_contacts_fetched)
         worker.error_occurred.connect(self._on_fetch_error)
         self._workers.append(worker)
         worker.start()
 
-    @pyqtSlot(object)
+    def _load_groups(self):
+        """Load list of WhatsApp groups into the group dropdown."""
+        if not self.wa_bot:
+            QMessageBox.warning(self, "Error", "WhatsApp Web not connected. Go to Auth tab first.")
+            return
+        if self._bot_busy:
+            QMessageBox.warning(self, "Busy", "Another WhatsApp operation is in progress. Please wait.")
+            return
+
+        self._bot_busy = True
+        self.load_groups_btn.setEnabled(False)
+        self.load_groups_btn.setText("Loading…")
+
+        worker = AsyncWorker(self.wa_bot.get_all_groups)
+        worker._args = (worker._progress_callback,)
+        worker.progress_update.connect(self._on_load_groups_progress)
+        worker.result_ready.connect(self._on_groups_loaded)
+        worker.error_occurred.connect(self._on_fetch_error)
+        self._workers.append(worker)
+        worker.start()
+
+    @Slot(str)
+    def _on_fetch_progress(self, msg):
+        """Show progress on the status label."""
+        self.fetch_status_lbl.setText(msg)
+
+    @Slot(str)
+    def _on_load_groups_progress(self, msg):
+        """Show progress on the status label and Load Groups button."""
+        self.fetch_status_lbl.setText(msg)
+        self.load_groups_btn.setText(msg[:25])
+
+    @Slot(object)
+    def _on_groups_loaded(self, groups):
+        """Populate the group dropdown with the fetched group names."""
+        self._bot_busy = False
+        self.group_combo.clear()
+        if groups:
+            self.group_combo.addItems(groups)
+            self.group_combo.setCurrentIndex(0)
+            self.fetch_status_lbl.setText(f"Loaded {len(groups)} groups. Select one and click Fetch.")
+        else:
+            self.group_combo.setPlaceholderText("No groups found")
+            self.fetch_status_lbl.setText("No groups found in your chat list.")
+        self.load_groups_btn.setEnabled(True)
+        self.load_groups_btn.setText("Load Groups")
+
+    @Slot(object)
     def _on_contacts_fetched(self, contacts):
+        self._bot_busy = False
         self._populate_table(contacts or [])
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch Contacts")
+        count = len(contacts) if contacts else 0
+        self.fetch_status_lbl.setText(f"✅ Fetched {count} contacts.")
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_fetch_error(self, err):
+        self._bot_busy = False
         QMessageBox.warning(self, "Fetch Error", err)
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch Contacts")
+        self.load_groups_btn.setEnabled(True)
+        self.load_groups_btn.setText("Load Groups")
+        self.fetch_status_lbl.setText(f"❌ Error: {err[:60]}")
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV Files (*.csv)")
@@ -608,19 +709,19 @@ class MainWindow(QMainWindow):
         if self.bulk_sender:
             self.bulk_sender.stop()
 
-    @pyqtSlot(int, int)
+    @Slot(int, int)
     def _on_send_progress(self, current, total):
         self.progress_bar.setValue(current)
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_send_log(self, msg):
         self.send_log.append(msg)
 
-    @pyqtSlot(str, str, str)
+    @Slot(str, str, str)
     def _on_send_status(self, phone, emoji, detail):
         pass  # Logged via log_message signal
 
-    @pyqtSlot(int, int)
+    @Slot(int, int)
     def _on_send_finished(self, success, fail):
         self.send_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
@@ -631,7 +732,7 @@ class MainWindow(QMainWindow):
             f"Sending complete!\n✅ Sent: {success}\n❌ Failed: {fail}"
         )
 
-    @pyqtSlot(str)
+    @Slot(str)
     def _on_send_error(self, err):
         self.send_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
@@ -709,7 +810,7 @@ def main():
     window = MainWindow()
     window.show()
     log_event("Application started.")
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
