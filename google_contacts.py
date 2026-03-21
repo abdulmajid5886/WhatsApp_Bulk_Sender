@@ -1,124 +1,121 @@
-"""
-Google Contacts integration module.
-Handles OAuth2 authentication and fetching phone numbers via the People API.
-"""
+"""Google People API: OAuth and contact phone export."""
 
-import os
+from __future__ import annotations
+
 import pickle
+from pathlib import Path
+from typing import Any
 
-from utils import log_event, handle_error, sanitize_phone
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
-
-# ---------------------------------------------------------------------------
-# OAuth2 Authentication
-# ---------------------------------------------------------------------------
-
-SCOPES = ["https://www.googleapis.com/auth/contacts.readonly"]
-TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.pickle")
-CREDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+SCOPES = ("https://www.googleapis.com/auth/contacts.readonly",)
 
 
-def authenticate_google():
-    """
-    Handle OAuth2 authentication for Google Contacts API.
-    Returns a credentials object, or None on failure.
-    """
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-
-    creds = None
-
-    # Load cached credentials
-    if os.path.exists(TOKEN_PATH):
+def _load_credentials(
+    credentials_path: Path, token_path: Path, force_reauth: bool
+) -> Credentials:
+    creds: Credentials | None = None
+    if token_path.exists() and not force_reauth:
         try:
-            with open(TOKEN_PATH, "rb") as token:
-                creds = pickle.load(token)
-        except Exception as exc:
-            log_event(f"Failed to load cached token: {exc}", "warning")
-
-    # Refresh or start new OAuth flow
+            with token_path.open("rb") as f:
+                creds = pickle.load(f)
+        except Exception:
+            creds = None
+    if creds and not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with token_path.open("wb") as f:
+                pickle.dump(creds, f)
+        else:
+            creds = None
     if not creds or not creds.valid:
-        try:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not os.path.exists(CREDS_PATH):
-                    log_event(
-                        "credentials.json not found. Download it from Google Cloud Console.",
-                        "error",
-                    )
-                    return None
-                flow = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
-                creds = flow.run_local_server(port=0)
-            # Persist for next run
-            with open(TOKEN_PATH, "wb") as token:
-                pickle.dump(creds, token)
-            log_event("Google OAuth2 authentication successful.")
-        except Exception as exc:
-            handle_error(exc, "Google OAuth2 authentication failed")
-            return None
-
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(credentials_path), list(SCOPES)
+        )
+        creds = flow.run_local_server(port=0)
+        with token_path.open("wb") as f:
+            pickle.dump(creds, f)
     return creds
 
 
-# ---------------------------------------------------------------------------
-# Fetch Contacts
-# ---------------------------------------------------------------------------
+def run_google_auth(
+    credentials_path: Path, token_path: Path, force_reauth: bool = False
+) -> None:
+    _load_credentials(credentials_path, token_path, force_reauth)
+    print("Google OAuth OK; token saved to", token_path)
 
-def fetch_google_contacts(creds=None) -> list[dict]:
-    """
-    Fetch all contacts with phone numbers from Google Contacts.
 
-    Args:
-        creds: google.oauth2.credentials.Credentials (if None, will authenticate)
+def fetch_google_contacts(
+    credentials_path: Path,
+    token_path: Path,
+    default_region: str | None,
+    force_reauth: bool = False,
+) -> list[dict[str, Any]]:
+    from utils import normalize_phone
 
-    Returns:
-        List of dicts: [{"name": "...", "phone": "+1234567890"}, ...]
-    """
-    from googleapiclient.discovery import build
-
-    if creds is None:
-        creds = authenticate_google()
-    if creds is None:
-        return []
-
-    try:
-        service = build("people", "v1", credentials=creds)
-        contacts: list[dict] = []
-        next_page_token = None
-
-        while True:
-            results = (
-                service.people()
-                .connections()
-                .list(
-                    resourceName="people/me",
-                    pageSize=1000,
-                    personFields="names,phoneNumbers",
-                    pageToken=next_page_token,
-                )
-                .execute()
+    creds = _load_credentials(credentials_path, token_path, force_reauth)
+    service = build("people", "v1", credentials=creds, cache_discovery=False)
+    connections: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while True:
+        req = (
+            service.people()
+            .connections()
+            .list(
+                resourceName="people/me",
+                personFields="names,phoneNumbers",
+                pageSize=1000,
+                pageToken=page_token,
             )
+        )
+        result = req.execute()
+        connections.extend(result.get("connections", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
 
-            connections = results.get("connections", [])
-            for person in connections:
-                names = person.get("names", [])
-                phones = person.get("phoneNumbers", [])
-                name = names[0].get("displayName", "Unknown") if names else "Unknown"
+    recipients: list[dict[str, Any]] = []
+    for person in connections:
+        names = person.get("names") or []
+        display = ""
+        if names:
+            display = (names[0].get("displayName") or "").strip()
+        for ph in person.get("phoneNumbers") or []:
+            raw = (ph.get("value") or "").strip()
+            e164 = normalize_phone(raw, default_region)
+            if not e164:
+                continue
+            recipients.append(
+                {
+                    "e164": e164,
+                    "name": display,
+                    "source": "google",
+                    "raw_phone": raw,
+                }
+            )
+    return recipients
 
-                for phone_entry in phones:
-                    raw = phone_entry.get("value", "")
-                    cleaned = sanitize_phone(raw)
-                    if cleaned:
-                        contacts.append({"name": name, "phone": cleaned})
 
-            next_page_token = results.get("nextPageToken")
-            if not next_page_token:
-                break
+def export_google_contacts(
+    credentials_path: Path,
+    token_path: Path,
+    out_json: Path | None,
+    out_csv: Path | None,
+    default_region: str | None,
+    force_reauth: bool,
+) -> list[dict[str, Any]]:
+    from utils import save_recipients_csv, save_recipients_json
 
-        log_event(f"Fetched {len(contacts)} contacts from Google.")
-        return contacts
-
-    except Exception as exc:
-        handle_error(exc, "Failed to fetch Google Contacts")
-        return []
+    recs = fetch_google_contacts(
+        credentials_path, token_path, default_region, force_reauth
+    )
+    if out_json:
+        save_recipients_json(out_json, recs)
+        print("Wrote", out_json, "(%d rows)" % len(recs))
+    if out_csv:
+        save_recipients_csv(out_csv, recs)
+        print("Wrote", out_csv, "(%d rows)" % len(recs))
+    return recs
