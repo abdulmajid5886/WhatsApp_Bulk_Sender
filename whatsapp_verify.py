@@ -6,6 +6,7 @@ changes landing pages or WhatsApp Web copy. Treat all verdicts as heuristic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
@@ -26,7 +27,7 @@ from whatsapp_automation import (
 )
 
 # Bump when changing HTTP body/URL rules so exported JSON stays interpretable.
-HTTP_HEURISTICS_VERSION = 1
+HTTP_HEURISTICS_VERSION = 2
 DOM_HEURISTICS_VERSION = 1
 
 # ---------------------------------------------------------------------------
@@ -46,12 +47,8 @@ HTTP_NOT_ON_WA_BODY_HINTS: tuple[str, ...] = (
     "could not look up this phone number",
 )
 
-HTTP_ON_WA_BODY_HINTS: tuple[str, ...] = (
-    "continue to chat",
-    "continue to whatsapp",
-    "message on whatsapp",
-    "chat on whatsapp",
-)
+# HTTP positive signal: after redirects, valid targets often get a final URL like
+# .../send/?phone=...&type=phone_number&app_absent=0 (body alone stays ambiguous).
 
 # ---------------------------------------------------------------------------
 # DOM: WhatsApp Web after /send?phone= — visible copy hints (lowercased body).
@@ -75,17 +72,14 @@ USER_AGENT = (
 )
 
 
-def _http_verdict_from_body(body: str, final_url: str) -> Verdict:
+def _http_verdict(body: str, final_url: str) -> Verdict:
     low = body.lower()
     for hint in HTTP_NOT_ON_WA_BODY_HINTS:
         if hint in low:
             return "not_on_wa"
-    for hint in HTTP_ON_WA_BODY_HINTS:
-        if hint in low:
-            return "on_wa"
-    # Final URL sometimes stays on api.whatsapp.com/send with generic shell — unknown.
-    if "web.whatsapp.com/send" in final_url.lower():
-        return "unknown"
+    u = final_url.lower()
+    if "type=phone_number" in u and "phone=" in u:
+        return "on_wa"
     return "unknown"
 
 
@@ -111,15 +105,18 @@ def http_probe_phone(digits: str, timeout_s: float = 20.0) -> dict[str, Any]:
             merged = ""
             last_status = 0
             last_url = ""
+            fetched: list[str] = []
+            verdict: Verdict = "unknown"
             for url in urls:
                 r = client.get(url)
+                fetched.append(url)
                 merged += "\n" + (r.text or "")
                 last_status = r.status_code
                 last_url = str(r.url)
-                verdict = _http_verdict_from_body(merged, last_url)
+                verdict = _http_verdict(merged, last_url)
                 if verdict != "unknown":
                     break
-            verdict = _http_verdict_from_body(merged, last_url)
+            verdict = _http_verdict(merged, last_url)
             snippet = merged[:8000]
             return {
                 "http_verdict": verdict,
@@ -127,10 +124,10 @@ def http_probe_phone(digits: str, timeout_s: float = 20.0) -> dict[str, Any]:
                     "status_code": last_status,
                     "final_url": last_url,
                     "body_length": len(merged),
-                    "urls_fetched": list(urls[: merged.count("\n") + 1]) if False else urls,
-                    "snippet_sha256": __import__("hashlib")
-                    .sha256(snippet.encode("utf-8", errors="replace"))
-                    .hexdigest()[:16],
+                    "urls_fetched": fetched,
+                    "snippet_sha256": hashlib.sha256(
+                        snippet.encode("utf-8", errors="replace")
+                    ).hexdigest()[:16],
                 },
                 "http_heuristic_version": HTTP_HEURISTICS_VERSION,
             }
@@ -258,14 +255,8 @@ def run_verify_batch(
 
         http_result = http_probe_phone(digits_only_e164(e164))
         http_v: Verdict = http_result.get("http_verdict", "unknown")  # type: ignore[assignment]
-
-        need_dom = not http_only and (dom_all or http_v == "unknown")
-        dom_v: Verdict | None = None
-        dom_meta: dict[str, Any] = {}
-
-        if need_dom:
-            # Defer browser until first DOM-needed row
-            pass
+        log("http %s -> %s" % (e164, http_v))
+        time.sleep(random.uniform(0.2, 0.6))
 
         row_base = {
             "e164": e164,
@@ -289,6 +280,7 @@ def run_verify_batch(
         _write_out(out_path, out_rows)
         if log_path:
             _write_log(log_path, lines)
+        print("Wrote", out_path, "(%d rows)" % len(out_rows))
         return out_rows
 
     dom_indices = [
@@ -308,6 +300,7 @@ def run_verify_batch(
         _write_out(out_path, out_rows)
         if log_path:
             _write_log(log_path, lines)
+        print("Wrote", out_path, "(%d rows)" % len(out_rows))
         return out_rows
 
     with sync_playwright() as p:

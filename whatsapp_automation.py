@@ -16,6 +16,10 @@ from utils import extract_phone_candidates, normalize_phone
 WA_URL = "https://web.whatsapp.com"
 
 # Centralized selectors; update when WhatsApp Web DOM changes.
+# After this many successful sends, add SEND_COOLDOWN_EXTRA_S to the inter-message delay.
+SEND_COOLDOWN_EVERY_N = 5
+SEND_COOLDOWN_EXTRA_S = 25.0
+
 SELECTORS = {
     "pane_side": "#pane-side",
     "chat_rows": [
@@ -243,7 +247,14 @@ def run_send_batch(
                 except Exception as ex:
                     log("FAIL %s: %s" % (e164, ex))
                 jitter = random.uniform(delay_min_s, delay_max_s)
-                log("sleep %.1fs" % jitter)
+                if sent > 0 and sent % SEND_COOLDOWN_EVERY_N == 0:
+                    jitter += SEND_COOLDOWN_EXTRA_S
+                    log(
+                        "cooldown: +%.0fs after %d successful sends (total %.1fs)"
+                        % (SEND_COOLDOWN_EXTRA_S, sent, jitter)
+                    )
+                else:
+                    log("sleep %.1fs" % jitter)
                 time.sleep(jitter)
         finally:
             ctx.close()

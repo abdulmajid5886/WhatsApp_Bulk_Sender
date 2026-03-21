@@ -1,16 +1,23 @@
 # WhatsApp sender (Web automation + Google Contacts)
 
-Python CLI that (1) loads phone numbers from **Google Contacts** via the People API, (2) **scrapes** what it can from **WhatsApp Web**’s chat list, (3) **merges and deduplicates** numbers (E.164), and (4) sends **text or media** with delays and logging.
+Python CLI that:
 
-**Important:** WhatsApp Web automation is **not** an official API. It can break when the site changes, and bulk messaging can trigger **rate limits or account restrictions**. Use **dry-run** and small tests first. You are responsible for **WhatsApp’s terms**, consent, and anti-spam rules.
+1. Loads phone numbers from **Google Contacts** (People API).
+2. **Scrapes** the **WhatsApp Web** chat list (what the UI exposes).
+3. **Merges and deduplicates** numbers (E.164).
+4. **Optionally verifies** numbers against WhatsApp (**HTTP** to `api.whatsapp.com` / `wa.me` + optional **Playwright** on Web).
+5. **Sends** text or media with throttling and logging.
+
+**Important:** WhatsApp Web automation is **not** an official API. It can break when the site changes; bulk use can trigger **rate limits or account restrictions**. Use **dry-run**, **`--allow`**, and **`--max-numbers`** for tests. You are responsible for **WhatsApp’s terms**, consent, and anti-spam rules.
 
 ---
 
 ## Prerequisites
 
 - **Python 3.10+** (tested with 3.12)
-- **Google Cloud**: [People API](https://developers.google.com/people) enabled, OAuth consent configured, OAuth **Desktop** client → download as `credentials.json` in the project root (or set `WA_SENDER_CREDENTIALS`)
-- **Playwright Chromium**: installed after `pip` (see below)
+- **Google Cloud**: [People API](https://developers.google.com/people) enabled, OAuth consent configured, OAuth **Desktop** client → `credentials.json` (or `WA_SENDER_CREDENTIALS`)
+- **Playwright Chromium**: `playwright install chromium` after `pip install`
+- Dependencies include **Playwright**, **Google API clients**, **phonenumbers**, **httpx** (for verify HTTP probes)
 
 ---
 
@@ -24,25 +31,39 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-**Use this environment for every command.** If you skip activation, `python` is your system interpreter and you will get `ModuleNotFoundError: No module named 'google'`.
+**Use this environment for every command.** If `python` is not the venv interpreter, you may see `ModuleNotFoundError` (e.g. missing `google` or `phonenumbers`).
 
 ```bash
-source .venv/bin/activate   # each new terminal session
-python main.py google-auth
-```
-
-Or call the venv’s Python directly (no activation needed):
-
-```bash
-.venv/bin/python main.py google-auth
-```
-
-Verify the CLI:
-
-```bash
+source .venv/bin/activate
 python main.py --help
-python main.py fetch-google --help
 ```
+
+Or without activating:
+
+```bash
+.venv/bin/python main.py --help
+```
+
+Always install with the **same** interpreter you use to run the app:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+---
+
+## Commands overview
+
+| Command | Purpose |
+|---------|---------|
+| `google-auth` | Google OAuth; writes `token.pickle` |
+| `fetch-google` | People API → `recipients_google.json` (and optional CSV) |
+| `scrape-whatsapp` | WhatsApp Web sidebar → `recipients_whatsapp.json` |
+| `merge` | Merge JSON inputs → `recipients_merged.json` (dedupe E.164) |
+| `verify-whatsapp` | Heuristic on-WA checks → `recipients_verified.json` |
+| `send` | Open chats, send text/media → `send.log` |
+
+Global options are on **each** subcommand that needs them (e.g. `--default-region`), not before the subcommand name.
 
 ---
 
@@ -50,30 +71,29 @@ python main.py fetch-google --help
 
 | Variable | Purpose |
 |----------|---------|
-| `WA_SENDER_CREDENTIALS` | Path to Google OAuth client JSON (default: `credentials.json`) |
-| `WA_SENDER_TOKEN` | Path to saved OAuth token (default: `token.pickle`) |
-| `WA_SENDER_SESSION` | Playwright user-data dir for WhatsApp (default: `.wa_session`) |
-| `WA_DEFAULT_REGION` | Default region for numbers without `+` (e.g. `US`, `GB`); can override with `--default-region` |
+| `WA_SENDER_CREDENTIALS` | Google OAuth client JSON (default: `credentials.json`) |
+| `WA_SENDER_TOKEN` | Saved OAuth token (default: `token.pickle`) |
+| `WA_SENDER_SESSION` | Playwright profile for WhatsApp (default: `.wa_session`) |
+| `WA_DEFAULT_REGION` | Region for numbers without `+` (e.g. `US`); override with `--default-region` |
 
 ---
 
-## Implementation checklist (from project plan)
+## Implementation checklist
 
-Use this as a build/verification list. All items are implemented in this repo.
-
-| # | Item | What to verify |
-|---|------|----------------|
-| 1 | **Project skeleton** | `requirements.txt`, `main.py` subcommands, Playwright Chromium installed |
-| 2 | **Google Contacts** | `google-auth` works; `fetch-google` writes JSON/CSV with E.164 numbers |
-| 3 | **WhatsApp session + scrape** | `.wa_session/` persists login; `scrape-whatsapp` writes `recipients_whatsapp.json` |
-| 4 | **Merge + dedupe** | `merge` combines Google + WhatsApp JSON, dedupes by E.164; `--allow` / `--block` work |
-| 5 | **Send** | `send` opens chats, sends text and/or media; `--dry-run`, delays, `--max-messages`, `send.log` |
+| # | Feature | Notes |
+|---|---------|--------|
+| 1 | Skeleton | `requirements.txt`, `main.py`, Playwright Chromium |
+| 2 | Google Contacts | OAuth + `fetch-google`, E.164 via `phonenumbers` |
+| 3 | WhatsApp scrape | Persistent `.wa_session/`, `scrape-whatsapp` |
+| 4 | Merge / dedupe | `--allow` / `--block` line files |
+| 5 | Send | `--dry-run`, delays, `--max-messages`, media |
+| 6 | Verify | HTTP + optional DOM; see below |
 
 ---
 
-## How to run (typical flow)
+## Typical workflow
 
-Run from the project root with the venv activated. Use `--default-region` when your contacts omit country codes (e.g. `--default-region US`).
+Run from the project root with the venv active. Use `--default-region` when numbers lack a country code.
 
 ### 1. Google OAuth (once)
 
@@ -81,88 +101,91 @@ Run from the project root with the venv activated. Use `--default-region` when y
 python main.py google-auth
 ```
 
-Completes in the browser; saves **`token.pickle`** (do not commit).
-
-### 2. Export Google contact phones
+### 2. Export Google phones
 
 ```bash
 python main.py fetch-google --default-region US
 ```
 
-Writes **`recipients_google.json`** (optional: `--out-csv path.csv`).
+Writes **`recipients_google.json`**. Each row is **one phone field** that passed validation, not necessarily one contact card. The People API uses **`connections.list`** only (not “Other contacts”). Contacts **without** a valid phone, or numbers **invalid** per `phonenumbers`, are omitted—so the row count is often **lower** than the total contacts shown in Google Contacts (~3k cards vs ~1.5k rows is normal).
 
-### 3. Scrape WhatsApp Web chat list
-
-Opens a browser; scan QR the first time. Session is stored under **`.wa_session/`**.
+### 3. Scrape WhatsApp Web
 
 ```bash
 python main.py scrape-whatsapp --default-region US
 ```
 
-Writes **`recipients_whatsapp.json`**. (Many chats show names only; numbers appear only when the UI exposes them.)
+QR login the first time; session in **`.wa_session/`**. Output: **`recipients_whatsapp.json`**.
 
-### 4. Merge lists
-
-Uses whichever of these files exist: `recipients_google.json`, `recipients_whatsapp.json`.
+### 4. Merge
 
 ```bash
 python main.py merge --default-region US
 ```
 
-Output: **`recipients_merged.json`**. Optional: `--out-csv merged.csv`, `--allow allow.txt`, `--block block.txt` (one phone per line, `#` comments allowed).
+Output: **`recipients_merged.json`**. Optional: `--out-csv`, `--allow`, `--block`.
 
-### 5. Send messages
+### 5. Verify (optional)
 
-**Always test with dry-run first:**
+Heuristic only—not a guarantee.
 
-```bash
-python main.py send --dry-run --message "Hello" --max-messages 3
-```
-
-Real send (after you trust the list):
+- **HTTP**: Follows redirects from `api.whatsapp.com/send?phone=…` and `wa.me/…`. **`not_on_wa`** if error-style phrases appear in the HTML. **`on_wa`** if the **final URL** contains `type=phone_number` and `phone=` (Meta’s usual shape for a resolvable chat link). Check **`http_heuristic_version`** in output when comparing old runs.
+- **Playwright** (default): if HTTP stays **`unknown`**, opens **WhatsApp Web** (same session as send) and inspects `/send?phone=…` (composer vs “not on WhatsApp” / invite copy).
 
 ```bash
-python main.py send --message "Hello" --delay-min 10 --delay-max 25 --log send.log
+# HTTP only (no browser; many unknown if URL signal missing)
+python main.py verify-whatsapp --http-only --max-numbers 50 --out recipients_verified.json
+
+# Default: HTTP for all; DOM only where HTTP is unknown (needs logged-in Web)
+python main.py verify-whatsapp --recipients recipients_merged.json --delay-min 5 --delay-max 12 --log verify.log
+
+# DOM on every row (slow)
+python main.py verify-whatsapp --dom-all --max-numbers 30
 ```
 
-With an image and caption:
+Output **`recipients_verified.json`** fields (per row): `e164`, `name`, `http_verdict`, `http_meta`, `http_heuristic_version`, `dom_verdict` (or `null` if skipped), `dom_meta`, `combined_verdict` (`on_wa` \| `not_on_wa` \| `unknown`). **`combined_verdict`** prefers DOM when that step ran and was conclusive; otherwise HTTP.
+
+Tune strings in **`whatsapp_verify.py`** if WhatsApp changes pages.
+
+### 6. Send
 
 ```bash
-python main.py send --media ./photo.jpg --message "Caption here"
+python main.py send --dry-run --message "Hello" --max-numbers 3
+python main.py send --message "Hello" --log send.log
 ```
 
-Optional: `--headless` (WhatsApp Web often needs a visible window for QR and stability), `--recipients other.json`, `--allow allow.txt`, `--block block.txt`.
+Default delay between messages is **random 10–20 seconds**. After every **5 successful** sends, an extra **25 seconds** is added to that wait (see `SEND_COOLDOWN_EVERY_N` / `SEND_COOLDOWN_EXTRA_S` in `whatsapp_automation.py`). Override with `--delay-min` / `--delay-max`.
+
+```bash
+python main.py send --message "Hello" --delay-min 12 --delay-max 18 --log send.log
+python main.py send --media ./photo.jpg --message "Caption"
+```
+
+Optional: `--headless`, `--recipients`, `--allow`, `--block`. Prefer **`--allow`** with one number for the first real send.
 
 ---
 
 ## How to test
 
-### A. Smoke tests (no Google / no WhatsApp)
+**Smoke**
 
 ```bash
 python main.py --help
 python main.py merge --help
 python main.py send --help
+python main.py verify-whatsapp --help
 ```
 
-### B. Test `merge` without Google
+**Merge** (two small JSON files, e.g. `a.json` / `b.json`):
 
-Create two small JSON files locally (your `.gitignore` may ignore `*.json`; that’s fine for local secrets/output).
-
-`a.json`:
+```json
+[{"e164": "+15551234567", "name": "Alice", "source": "test"}]
+```
 
 ```json
 [
-  {"e164": "+15551234567", "name": "Alice", "source": "test"}
-]
-```
-
-`b.json`:
-
-```json
-[
-  {"e164": "+15551234567", "name": "Alice Longer Name", "source": "test2"},
-  {"e164": "+447911123456", "name": "Bob", "source": "test2"}
+  {"e164": "+15551234567", "name": "Alice Longer", "source": "t2"},
+  {"e164": "+447911123456", "name": "Bob", "source": "t2"}
 ]
 ```
 
@@ -170,51 +193,41 @@ Create two small JSON files locally (your `.gitignore` may ignore `*.json`; that
 python main.py merge --google a.json --whatsapp b.json --out merged_test.json
 ```
 
-Expect one row for `+15551234567` (longer name kept) plus `+447911123456`.
-
-### C. Test `send` without messaging anyone
-
-Use a JSON list with **your own** number as the only `e164`, then:
+**Send dry-run** (no browser)
 
 ```bash
 python main.py send --dry-run --recipients merged_test.json --message "test"
 ```
 
-Dry-run does **not** open the browser and writes lines to **`send.log`** (default).
+**Verify** (small list, HTTP-only)
 
-### D. End-to-end (real)
-
-1. `python main.py google-auth`
-2. `python main.py fetch-google --default-region XX`
-3. `python main.py scrape-whatsapp` (log in, wait for chat list)
-4. `python main.py merge`
-5. `python main.py send --dry-run --message "Hi" --max-messages 1`
-6. `python main.py send --message "Hi" --allow allow.txt` where `allow.txt` contains **one** test number
+```bash
+python main.py verify-whatsapp --http-only --recipients merged_test.json --max-numbers 5 --out test_verified.json
+```
 
 ---
 
-## Files you will see locally
+## Local files (do not commit secrets)
 
-| File / dir | Purpose |
-|------------|---------|
-| `credentials.json` | Google OAuth client (keep private) |
-| `token.pickle` | Google refresh token (keep private) |
-| `.wa_session/` | WhatsApp Web browser profile (keep private) |
-| `recipients_*.json` | Exported / merged lists |
-| `send.log` | Send run log |
+| Path | Purpose |
+|------|---------|
+| `credentials.json` | Google OAuth client |
+| `token.pickle` | Google token |
+| `.wa_session/` | WhatsApp browser profile |
+| `recipients_google.json` / `recipients_whatsapp.json` / `recipients_merged.json` | Lists |
+| `recipients_verified.json` | Verify verdicts |
+| `send.log` / `verify.log` | Run logs |
+
+Your `.gitignore` may ignore `*.json` and logs—keep tokens and session dirs private regardless.
 
 ---
 
 ## Troubleshooting
 
-- **`ModuleNotFoundError: No module named 'phonenumbers'`** (or any other package from `requirements.txt`): same fix — run **`python -m pip install -r requirements.txt`** with the same `python` you use for `main.py`, or use **`.venv/bin/python -m pip install -r requirements.txt`**.
-- **`ModuleNotFoundError: No module named 'google'`** (even with `(.venv)` in your prompt): the `python` you run is **not** the one where packages were installed—common with **conda**, **pyenv**, or activating a venv from the wrong folder. Fix:
-  1. `cd` to the project root (where `main.py` and `.venv` live).
-  2. Run **`python -m pip install -r requirements.txt`** (using the *same* `python` you use for `main.py`). That guarantees installs match the interpreter.
-  3. Check: `python -c "import sys; print(sys.executable)"` — it should end with **`whatsApp_sender/.venv/bin/python`** (or your chosen venv).
-  4. If not, use the full path: **`.venv/bin/python -m pip install -r requirements.txt`** then **`.venv/bin/python main.py fetch-google …`**.
-- **Other `ModuleNotFoundError`**: same as above — always use `python -m pip install -r requirements.txt` with the interpreter you run the app with.
-- **Playwright browser missing**: run `playwright install chromium`.
-- **Google `access_denied` / consent**: add your Google account as a test user in the OAuth consent screen (if the app is in Testing).
-- **WhatsApp selectors fail**: WhatsApp Web DOM changes; update `SELECTORS` in `whatsapp_automation.py`.
-- **Invalid phone / wrong country**: set `--default-region` or use full E.164 (`+…`) in your source data.
+- **`ModuleNotFoundError`** (`google`, `phonenumbers`, `httpx`, …): run **`python -m pip install -r requirements.txt`** with the **same** `python` as `main.py`, or **`.venv/bin/python -m pip install -r requirements.txt`**.
+- **Wrong interpreter despite `(.venv)` prompt**: run `python -c "import sys; print(sys.executable)"` and fix PATH / use `.venv/bin/python` explicitly.
+- **Playwright browser missing**: `playwright install chromium`.
+- **Google OAuth / consent**: enable People API; add test users if the app is in Testing.
+- **WhatsApp send/scrape breaks**: update **`SELECTORS`** in `whatsapp_automation.py`.
+- **Verify always `unknown`**: re-run after pulling changes; check **`http_heuristic_version`**; try **`--dom-all`** on a tiny `--allow` list; adjust **`whatsapp_verify.py`** hints if Meta changed URLs or Web UI strings.
+- **Wrong country / parsing**: use **`--default-region`** or full E.164 (`+…`).

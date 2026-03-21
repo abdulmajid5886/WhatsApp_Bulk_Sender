@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI: Google Contacts fetch, WhatsApp scrape, merge, send.
+"""CLI: Google Contacts fetch, WhatsApp scrape, merge, verify, send.
 
 Setup: python -m venv .venv && source .venv/bin/activate
         pip install -r requirements.txt && playwright install chromium
@@ -151,6 +151,35 @@ def cmd_send(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_verify_whatsapp(args: argparse.Namespace) -> None:
+    try:
+        from utils import apply_allow_block, load_recipients_json
+        from whatsapp_verify import run_verify_batch
+    except ImportError as e:
+        _deps_import_error_hint()
+        raise SystemExit(1) from e
+
+    recs = load_recipients_json(args.recipients)
+    recs = apply_allow_block(
+        recs,
+        allow_path=args.allow,
+        block_path=args.block,
+        default_region=args.default_region,
+    )
+    run_verify_batch(
+        recipients=recs,
+        user_data_dir=args.session,
+        headless=args.headless,
+        delay_min_s=args.delay_min,
+        delay_max_s=args.delay_max,
+        http_only=args.http_only,
+        dom_all=args.dom_all,
+        out_path=args.out,
+        log_path=args.log,
+        max_numbers=args.max_numbers,
+    )
+
+
 def _region_parent() -> argparse.ArgumentParser:
     """Shared --default-region (must live on subparsers; parent-only flags must appear before the subcommand)."""
     rp = argparse.ArgumentParser(add_help=False)
@@ -219,13 +248,40 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--session", type=Path, default=_default_wa_session())
     sd.add_argument("--headless", action="store_true")
     sd.add_argument("--dry-run", action="store_true")
-    sd.add_argument("--delay-min", type=float, default=8.0)
+    sd.add_argument("--delay-min", type=float, default=10.0)
     sd.add_argument("--delay-max", type=float, default=20.0)
     sd.add_argument("--max-messages", type=int, default=None)
     sd.add_argument("--log", type=Path, default=Path("send.log"))
     sd.add_argument("--allow", type=Path, default=None)
     sd.add_argument("--block", type=Path, default=None)
     sd.set_defaults(func=cmd_send)
+
+    vw = sub.add_parser(
+        "verify-whatsapp",
+        parents=[region_p],
+        help="Heuristic check: HTTP (api.whatsapp.com / wa.me) + optional Web DOM",
+    )
+    vw.add_argument("--recipients", type=Path, default=Path("recipients_merged.json"))
+    vw.add_argument("--out", type=Path, default=Path("recipients_verified.json"))
+    vw.add_argument("--session", type=Path, default=_default_wa_session())
+    vw.add_argument("--headless", action="store_true")
+    vw.add_argument("--delay-min", type=float, default=8.0)
+    vw.add_argument("--delay-max", type=float, default=20.0)
+    vw.add_argument(
+        "--http-only",
+        action="store_true",
+        help="Skip Playwright; HTTP heuristics only (many unknown)",
+    )
+    vw.add_argument(
+        "--dom-all",
+        action="store_true",
+        help="Run DOM check for every number (slow)",
+    )
+    vw.add_argument("--log", type=Path, default=Path("verify.log"))
+    vw.add_argument("--allow", type=Path, default=None)
+    vw.add_argument("--block", type=Path, default=None)
+    vw.add_argument("--max-numbers", type=int, default=None)
+    vw.set_defaults(func=cmd_verify_whatsapp)
 
     return p
 
