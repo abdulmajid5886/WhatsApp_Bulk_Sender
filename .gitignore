@@ -6,3 +6,4 @@ token.pickle
 .venv
 .vscode
 .DS_Store
+*.txt

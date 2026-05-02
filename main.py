@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI: Google Contacts fetch, WhatsApp scrape, merge, verify, send.
+"""CLI: Google Contacts fetch, WhatsApp scrape, group members, merge, verify, send.
 
 Setup: python -m venv .venv && source .venv/bin/activate
         pip install -r requirements.txt && playwright install chromium
@@ -80,6 +80,93 @@ def cmd_scrape_whatsapp(args: argparse.Namespace) -> None:
     except ImportError as e:
         _deps_import_error_hint()
         raise SystemExit(1) from e
+
+
+def cmd_group_members(args: argparse.Namespace) -> None:
+    try:
+        from whatsapp_groups import load_group_names, load_groups_spec, run_group_members_batch
+    except ImportError as e:
+        _deps_import_error_hint()
+        raise SystemExit(1) from e
+
+    if args.groups_json and args.groups_file:
+        print("Use only one of --groups-file or --groups-json.", file=sys.stderr)
+        sys.exit(1)
+    if not args.groups_json and not args.groups_file:
+        print(
+            "Provide --groups-json (recommended) or --groups-file. "
+            "Discover groups first:  python main.py list-whatsapp-groups --out whatsapp_groups.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    groups: list[dict[str, Any]] = []
+    if args.groups_json:
+        if not args.groups_json.exists():
+            print("groups JSON not found:", args.groups_json.resolve(), file=sys.stderr)
+            sys.exit(1)
+        groups = load_groups_spec(args.groups_json)
+        if not groups:
+            print("No groups in JSON (need title per item).", file=sys.stderr)
+            sys.exit(1)
+    else:
+        assert args.groups_file is not None
+        if not args.groups_file.exists():
+            p = args.groups_file.resolve()
+            print("groups file not found:", p, file=sys.stderr)
+            print(
+                "Create it in the project folder with one WhatsApp group title per line, e.g.:",
+                file=sys.stderr,
+            )
+            print("  cp groups.example.txt groups.txt", file=sys.stderr)
+            print(
+                "  # or: python main.py list-whatsapp-groups --out whatsapp_groups.json",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        names = load_group_names(args.groups_file)
+        if not names:
+            print("No group names in file (non-empty, non-# lines).", file=sys.stderr)
+            sys.exit(1)
+        groups = [{"title": n, "data_id": None} for n in names]
+
+    if args.dry_run:
+        print("%d group(s) would be scraped (in order):" % len(groups))
+        for i, g in enumerate(groups, 1):
+            did = g.get("data_id")
+            extra = ("  [%s]" % did) if did else ""
+            print("  %d. %s%s" % (i, g.get("title", ""), extra))
+        return
+    run_group_members_batch(
+        groups=groups,
+        user_data_dir=args.session,
+        headless=args.headless,
+        default_region=args.default_region,
+        out_path=args.out,
+        split_files=args.split_files,
+        split_dir=args.split_dir,
+        pause_min_s=args.pause_min,
+        pause_max_s=args.pause_max,
+        max_groups=args.max_groups,
+    )
+
+
+def cmd_list_whatsapp_groups(args: argparse.Namespace) -> None:
+    try:
+        from whatsapp_groups import run_discover_groups
+    except ImportError as e:
+        _deps_import_error_hint()
+        raise SystemExit(1) from e
+
+    run_discover_groups(
+        user_data_dir=args.session,
+        headless=args.headless,
+        out_path=args.out,
+        max_scrolls=args.max_scrolls,
+        probe_out=args.probe_out,
+        verbose=args.verbose,
+        use_groups_filter=not args.no_groups_tab,
+    )
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
@@ -223,6 +310,99 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--out", type=Path, default=Path("recipients_whatsapp.json"))
     sw.add_argument("--headless", action="store_true")
     sw.set_defaults(func=cmd_scrape_whatsapp)
+
+    gm = sub.add_parser(
+        "group-members",
+        parents=[region_p],
+        help="Open each group, scrape participant list to JSON (prefer --groups-json from list-whatsapp-groups)",
+    )
+    gm.add_argument(
+        "--groups-json",
+        type=Path,
+        default=None,
+        help="From list-whatsapp-groups: titles + data_id per group (opens correct sidebar row)",
+    )
+    gm.add_argument(
+        "--groups-file",
+        type=Path,
+        default=None,
+        help="One group chat title per line (# comments ok); no data_id (search-only open)",
+    )
+    gm.add_argument("--session", type=Path, default=_default_wa_session())
+    gm.add_argument("--headless", action="store_true")
+    gm.add_argument("--out", type=Path, default=Path("group_members.json"))
+    gm.add_argument(
+        "--split-files",
+        action="store_true",
+        help="Also write group_members_<slug>.json per group",
+    )
+    gm.add_argument(
+        "--split-dir",
+        type=Path,
+        default=None,
+        help="Directory for --split-files (default: same as --out parent)",
+    )
+    gm.add_argument(
+        "--pause-min",
+        type=float,
+        default=2.0,
+        help="Seconds between groups (min)",
+    )
+    gm.add_argument(
+        "--pause-max",
+        type=float,
+        default=5.0,
+        help="Seconds between groups (max)",
+    )
+    gm.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only print group names from file; do not open browser",
+    )
+    gm.add_argument(
+        "--max-groups",
+        type=int,
+        default=None,
+        help="Scrape only the first N groups from the list (debug)",
+    )
+    gm.set_defaults(func=cmd_group_members)
+
+    lg = sub.add_parser(
+        "list-whatsapp-groups",
+        parents=[region_p],
+        help="Scroll chat list and save all group chats (@g.us) to JSON",
+    )
+    lg.add_argument("--session", type=Path, default=_default_wa_session())
+    lg.add_argument("--headless", action="store_true")
+    lg.add_argument(
+        "--out",
+        type=Path,
+        default=Path("whatsapp_groups.json"),
+        help="Written as { groups: [ { title, data_id } ], ... }",
+    )
+    lg.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=80,
+        help="How many times to scroll the sidebar to load more chats",
+    )
+    lg.add_argument(
+        "--probe-out",
+        type=Path,
+        default=None,
+        help="Write sidebar DOM summary (data_id_samples, row counts) for debugging 0 groups",
+    )
+    lg.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print diagnosis and row/heuristic counts to stderr",
+    )
+    lg.add_argument(
+        "--no-groups-tab",
+        action="store_true",
+        help="Do not click the sidebar Groups chip (heuristics / fallback only)",
+    )
+    lg.set_defaults(func=cmd_list_whatsapp_groups)
 
     mg = sub.add_parser(
         "merge",
